@@ -36,17 +36,17 @@
 
 #include "lcec_el6021.h"
 
-#include "../lcec.h"
-
 #include <ecrt.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <pthread.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <termios.h>
 #include <unistd.h>
+
+#include "../lcec.h"
 
 #ifdef LCEC_HAVE_CUSE
 #define FUSE_USE_VERSION 31
@@ -67,8 +67,8 @@
 #define LCEC_TCSETSW2 0x402c542c
 #define LCEC_TCSETSF2 0x402c542d
 #define LCEC_TCFLSH 0x540b
-#define LCEC_TCSBRK 0x5409   // tcdrain() is TCSBRK with a non-zero arg
-#define LCEC_TCSBRKP 0x5425
+#define LCEC_TCSBRK   0x5409  // tcdrain() is TCSBRK with a non-zero arg
+#define LCEC_TCSBRKP  0x5425
 
 // kernel UAPI struct termios (asm-generic): NCCS=19, no speed fields.
 // glibc's struct termios differs (NCCS=32 + ispeed/ospeed), so do not
@@ -85,13 +85,13 @@ typedef struct {
 } lcec_ktermios_t;
 
 // size of the kernel's struct termios (no speed fields) and struct termios2
-#define LCEC_KTERMIOS_SIZE offsetof(lcec_ktermios_t, c_ispeed)
+#define LCEC_KTERMIOS_SIZE  offsetof(lcec_ktermios_t, c_ispeed)
 #define LCEC_KTERMIOS2_SIZE sizeof(lcec_ktermios_t)
 
 // Kernel UAPI baud encoding in c_cflag (asm-generic/termbits.h).  glibc >= 2.42
 // defines B9600 etc. as plain numbers, so they cannot be compared with what
 // the kernel passes in c_cflag.
-#define LCEC_KCBAUD 0x0000100f
+#define LCEC_KCBAUD  0x0000100f
 #define LCEC_KBOTHER 0x00001000
 
 typedef enum {
@@ -114,8 +114,16 @@ typedef struct {
 
 /// EL600x supported baud rates (SDO 0x8000:11 values)
 static const lcec_el6021_baud_t lcec_el6021_baud_table[] = {
-    {1, 300, 0x0007},  {2, 600, 0x0008},   {3, 1200, 0x0009},  {4, 2400, 0x000b},   {5, 4800, 0x000c},
-    {6, 9600, 0x000d}, {7, 19200, 0x000e}, {8, 38400, 0x000f}, {9, 57600, 0x1001}, {10, 115200, 0x1002},
+    {1, 300, 0x0007},
+    {2, 600, 0x0008},
+    {3, 1200, 0x0009},
+    {4, 2400, 0x000b},
+    {5, 4800, 0x000c},
+    {6, 9600, 0x000d},
+    {7, 19200, 0x000e},
+    {8, 38400, 0x000f},
+    {9, 57600, 0x1001},
+    {10, 115200, 0x1002},
 };
 
 typedef struct {
