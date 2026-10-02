@@ -67,6 +67,8 @@
 #define LCEC_TCSETSW2 0x402c542c
 #define LCEC_TCSETSF2 0x402c542d
 #define LCEC_TCFLSH 0x540b
+#define LCEC_TCSBRK 0x5409   // tcdrain() is TCSBRK with a non-zero arg
+#define LCEC_TCSBRKP 0x5425
 
 // kernel UAPI struct termios (asm-generic): NCCS=19, no speed fields.
 // glibc's struct termios differs (NCCS=32 + ispeed/ospeed), so do not
@@ -1051,6 +1053,20 @@ static void cuse_ioctl(fuse_req_t req, int cmd, void *arg, struct fuse_file_info
       }
       if ((long)arg == TCOFLUSH || (long)arg == TCIOFLUSH) {
         hal_data->tx_w = hal_data->tx_r;
+      }
+      fuse_reply_ioctl(req, 0, NULL, 0);
+      return;
+
+    case LCEC_TCSBRK:
+    case LCEC_TCSBRKP:
+      // tcdrain(): wait until the RT side has handed every queued byte to
+      // the terminal (bounded, so a stalled bus cannot hang the caller).
+      // A real break (arg 0) is not supported by the EL6021 and is accepted
+      // as a no-op like TIOCSBRK.
+      if ((long)arg != 0 || cmd == LCEC_TCSBRKP) {
+        for (int i = 0; i < 2000 && ring_avail(&hal_data->tx_w, &hal_data->tx_r) > 0; i++) {
+          usleep(1000);
+        }
       }
       fuse_reply_ioctl(req, 0, NULL, 0);
       return;
