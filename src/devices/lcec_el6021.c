@@ -40,6 +40,7 @@
 
 #include <ecrt.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
@@ -77,7 +78,19 @@ typedef struct {
   tcflag_t c_lflag;
   cc_t c_line;
   cc_t c_cc[19];
+  unsigned int c_ispeed;  // termios2 only (TCGETS2 / TCSETS2)
+  unsigned int c_ospeed;
 } lcec_ktermios_t;
+
+// size of the kernel's struct termios (no speed fields) and struct termios2
+#define LCEC_KTERMIOS_SIZE offsetof(lcec_ktermios_t, c_ispeed)
+#define LCEC_KTERMIOS2_SIZE sizeof(lcec_ktermios_t)
+
+// Kernel UAPI baud encoding in c_cflag (asm-generic/termbits.h).  glibc >= 2.42
+// defines B9600 etc. as plain numbers, so they cannot be compared with what
+// the kernel passes in c_cflag.
+#define LCEC_KCBAUD 0x0000100f
+#define LCEC_KBOTHER 0x00001000
 
 typedef enum {
   LCEC_EL6021_STATE_REQUEST_INIT,
@@ -99,8 +112,8 @@ typedef struct {
 
 /// EL600x supported baud rates (SDO 0x8000:11 values)
 static const lcec_el6021_baud_t lcec_el6021_baud_table[] = {
-    {1, 300, B300},       {2, 600, B600},       {3, 1200, B1200},     {4, 2400, B2400},   {5, 4800, B4800},
-    {6, 9600, B9600},     {7, 19200, B19200},   {8, 38400, B38400},   {9, 57600, B57600}, {10, 115200, B115200},
+    {1, 300, 0x0007},  {2, 600, 0x0008},   {3, 1200, 0x0009},  {4, 2400, 0x000b},   {5, 4800, 0x000c},
+    {6, 9600, 0x000d}, {7, 19200, 0x000e}, {8, 38400, 0x000f}, {9, 57600, 0x1001}, {10, 115200, 0x1002},
 };
 
 typedef struct {
@@ -184,6 +197,7 @@ typedef struct {
   char tty_name[LCEC_CONF_STR_MAXLEN];
   int tty_enabled;
   int efd;
+  int stop_efd;  // wakes the CUSE thread's blocking read on shutdown
   volatile int thread_stop;
   pthread_t cuse_thread;
   pthread_t notify_thread;
@@ -417,16 +431,17 @@ static const lcec_el6021_frame_t *frame_by_string(const char *s) {
 }
 
 // map a termios c_cflag to SDO indices. Returns 0 on success.
-static int cflag_to_config(tcflag_t cflag, uint8_t *baud_idx, uint8_t *frame_idx, uint8_t *rtscts) {
+static int cflag_to_config(tcflag_t cflag, unsigned int ospeed, uint8_t *baud_idx, uint8_t *frame_idx, uint8_t *rtscts) {
   uint8_t data_bits, stop_bits;
   char parity;
   const lcec_el6021_baud_t *b = NULL;
   const lcec_el6021_frame_t *f;
-  tcflag_t cbaud = cflag & CBAUD;
+  tcflag_t cbaud = cflag & LCEC_KCBAUD;
   size_t i;
 
+  // BOTHER carries the rate in c_ospeed (termios2); match it by value
   for (i = 0; i < sizeof(lcec_el6021_baud_table) / sizeof(lcec_el6021_baud_table[0]); i++) {
-    if (lcec_el6021_baud_table[i].speed == cbaud) {
+    if ((cbaud == LCEC_KBOTHER) ? (lcec_el6021_baud_table[i].baud == ospeed) : (lcec_el6021_baud_table[i].speed == cbaud)) {
       b = &lcec_el6021_baud_table[i];
       break;
     }
@@ -471,6 +486,8 @@ static void config_to_ktermios(lcec_el6021_data_t *hal_data, lcec_ktermios_t *ti
 
   memset(tio, 0, sizeof(*tio));
   tio->c_cflag = b->speed | CREAD | CLOCAL;
+  tio->c_ispeed = b->baud;
+  tio->c_ospeed = b->baud;
   if (f != NULL) {
     tio->c_cflag |= (f->data_bits == 7) ? CS7 : CS8;
     if (f->parity != 'N') {
@@ -490,10 +507,10 @@ static void config_to_ktermios(lcec_el6021_data_t *hal_data, lcec_ktermios_t *ti
 
 // mark a new serial port configuration for the RT thread to apply.
 // Returns 0 if the requested configuration is supported.
-static int request_config(lcec_el6021_data_t *hal_data, tcflag_t cflag) {
+static int request_config(lcec_el6021_data_t *hal_data, tcflag_t cflag, unsigned int ospeed) {
   uint8_t baud_idx, frame_idx, rtscts;
 
-  if (cflag_to_config(cflag, &baud_idx, &frame_idx, &rtscts) != 0) {
+  if (cflag_to_config(cflag, ospeed, &baud_idx, &frame_idx, &rtscts) != 0) {
     return -1;
   }
   if (rtscts && !hal_data->has_rtscts) {
@@ -525,6 +542,7 @@ static int lcec_el6021_init(int comp_id, lcec_slave_t *slave) {
   slave->hal_data = hal_data;
   memset(hal_data, 0, sizeof(*hal_data));
   hal_data->efd = -1;
+  hal_data->stop_efd = -1;
 
   // defaults: 9600 8N1, no handshake
   hal_data->req_baud = baud_by_value(9600)->idx;
@@ -861,9 +879,28 @@ static ssize_t cuse_io_writev(int fd, struct iovec *iov, int count, void *userda
   return writev(fd, iov, count);
 }
 
+// fuse_session_exit() only sets a flag; the session loop sits in this read
+// until the kernel sends a request.  Wait on the stop eventfd as well, so
+// lcec_el6021_cuse_stop() can end the loop (EINTR after exit ends it).
 static ssize_t cuse_io_read(int fd, void *buf, size_t buf_len, void *userdata) {
-  (void)userdata;
-  return read(fd, buf, buf_len);
+  lcec_el6021_data_t *hal_data = userdata;
+  struct pollfd pfd[2] = {{fd, POLLIN, 0}, {hal_data->stop_efd, POLLIN, 0}};
+
+  for (;;) {
+    if (poll(pfd, 2, -1) < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (pfd[1].revents) {
+      errno = EINTR;
+      return -1;
+    }
+    if (pfd[0].revents) {
+      return read(fd, buf, buf_len);
+    }
+  }
 }
 
 static const struct fuse_custom_io cuse_io = {
@@ -949,6 +986,7 @@ static void cuse_ioctl(fuse_req_t req, int cmd, void *arg, struct fuse_file_info
   lcec_el6021_data_t *hal_data = fuse_req_userdata(req);
   struct iovec iov;
   lcec_ktermios_t tio;
+  size_t tio_size;
   uint32_t avail;
   int mstate;
   (void)fi;
@@ -961,16 +999,17 @@ static void cuse_ioctl(fuse_req_t req, int cmd, void *arg, struct fuse_file_info
   switch (cmd) {
     case TCGETS:
     case LCEC_TCGETS2:
+      tio_size = (cmd == TCGETS) ? LCEC_KTERMIOS_SIZE : LCEC_KTERMIOS2_SIZE;
       if (!out_bufsz) {
         iov.iov_base = arg;
-        iov.iov_len = sizeof(lcec_ktermios_t);
+        iov.iov_len = tio_size;
         fuse_reply_ioctl_retry(req, NULL, 0, &iov, 1);
         return;
       }
       pthread_mutex_lock(&hal_data->lock);
       tio = hal_data->tio;
       pthread_mutex_unlock(&hal_data->lock);
-      fuse_reply_ioctl(req, 0, &tio, sizeof(tio));
+      fuse_reply_ioctl(req, 0, &tio, tio_size);
       return;
 
     case TCSETS:
@@ -979,13 +1018,16 @@ static void cuse_ioctl(fuse_req_t req, int cmd, void *arg, struct fuse_file_info
     case LCEC_TCSETS2:
     case LCEC_TCSETSW2:
     case LCEC_TCSETSF2:
+      tio_size = (cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF) ? LCEC_KTERMIOS_SIZE : LCEC_KTERMIOS2_SIZE;
       if (!in_bufsz) {
         iov.iov_base = arg;
-        iov.iov_len = sizeof(lcec_ktermios_t);
+        iov.iov_len = tio_size;
         fuse_reply_ioctl_retry(req, &iov, 1, NULL, 0);
         return;
       }
-      if (request_config(hal_data, ((const lcec_ktermios_t *)in_buf)->c_cflag) != 0) {
+      memset(&tio, 0, sizeof(tio));
+      memcpy(&tio, in_buf, in_bufsz < tio_size ? in_bufsz : tio_size);
+      if (request_config(hal_data, tio.c_cflag, tio.c_ospeed) != 0) {
         rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "%s: unsupported serial configuration requested\n",
             hal_data->tty_name);
         fuse_reply_err(req, EINVAL);
@@ -1138,7 +1180,8 @@ static int lcec_el6021_cuse_start(lcec_slave_t *slave) {
   lcec_el6021_data_t *hal_data = (lcec_el6021_data_t *)slave->hal_data;
 
   hal_data->efd = eventfd(0, 0);
-  if (hal_data->efd < 0) {
+  hal_data->stop_efd = eventfd(0, 0);
+  if (hal_data->efd < 0 || hal_data->stop_efd < 0) {
     rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "%s: eventfd failed: %s\n", hal_data->tty_name, strerror(errno));
     return -1;
   }
@@ -1178,12 +1221,15 @@ static void lcec_el6021_cuse_stop(lcec_slave_t *slave) {
     fuse_session_exit(hal_data->cuse_se);
   }
   unused = write(hal_data->efd, &one, sizeof(one));
+  unused = write(hal_data->stop_efd, &one, sizeof(one));
   (void)unused;
 
   pthread_join(hal_data->cuse_thread, NULL);
   pthread_join(hal_data->notify_thread, NULL);
   close(hal_data->efd);
   hal_data->efd = -1;
+  close(hal_data->stop_efd);
+  hal_data->stop_efd = -1;
   hal_data->tty_enabled = 0;
 }
 
