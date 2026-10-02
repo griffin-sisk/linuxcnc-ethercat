@@ -129,6 +129,8 @@ typedef struct {
 
   // PDO offsets
   unsigned int ctrl_os;
+  unsigned int ctrl_bp;  // bit 0 of a byte: the word starts there
+  unsigned int status_bp;
   unsigned int tx_os;
   unsigned int status_os;
   unsigned int rx_os;
@@ -204,61 +206,77 @@ static const lcec_pindesc_t slave_pins[] = {
     {HAL_TYPE_UNSPECIFIED, HAL_DIR_UNSPECIFIED, -1, NULL},
 };
 
+// The terminals' fixed 22-byte COM maps.  The control/status bits and the
+// length byte form one little-endian 16-bit word at the first entry, which is
+// how the handshake below reads and writes them.
 static ec_pdo_entry_info_t lcec_el6021_pdo_entries_out[] = {
-    {0x7001, 0x01, 16},  // Ctrl
-    {0x7000, 0x11, 8},   // Data Out 0
-    {0x7000, 0x12, 8},   // Data Out 1
-    {0x7000, 0x13, 8},   // Data Out 2
-    {0x7000, 0x14, 8},   // Data Out 3
-    {0x7000, 0x15, 8},   // Data Out 4
-    {0x7000, 0x16, 8},   // Data Out 5
-    {0x7000, 0x17, 8},   // Data Out 6
-    {0x7000, 0x18, 8},   // Data Out 7
-    {0x7000, 0x19, 8},   // Data Out 8
-    {0x7000, 0x1a, 8},   // Data Out 9
-    {0x7000, 0x1b, 8},   // Data Out 10
-    {0x7000, 0x1c, 8},   // Data Out 11
-    {0x7000, 0x1d, 8},   // Data Out 12
-    {0x7000, 0x1e, 8},   // Data Out 13
-    {0x7000, 0x1f, 8},   // Data Out 14
-    {0x7000, 0x20, 8},   // Data Out 15
-    {0x7000, 0x21, 8},   // Data Out 16
-    {0x7000, 0x22, 8},   // Data Out 17
-    {0x7000, 0x23, 8},   // Data Out 18
-    {0x7000, 0x24, 8},   // Data Out 19
-    {0x7000, 0x25, 8},   // Data Out 20
-    {0x7000, 0x26, 8},   // Data Out 21
+    {0x7000, 0x01, 1},  // Transmit request
+    {0x7000, 0x02, 1},  // Receive accepted
+    {0x7000, 0x03, 1},  // Init request
+    {0x7000, 0x04, 1},  // Send continuous
+    {0x0000, 0x00, 4},  // gap
+    {0x7000, 0x09, 8},  // Output length
+    {0x7000, 0x11, 8},  // Data Out 0
+    {0x7000, 0x12, 8},  // Data Out 1
+    {0x7000, 0x13, 8},  // Data Out 2
+    {0x7000, 0x14, 8},  // Data Out 3
+    {0x7000, 0x15, 8},  // Data Out 4
+    {0x7000, 0x16, 8},  // Data Out 5
+    {0x7000, 0x17, 8},  // Data Out 6
+    {0x7000, 0x18, 8},  // Data Out 7
+    {0x7000, 0x19, 8},  // Data Out 8
+    {0x7000, 0x1a, 8},  // Data Out 9
+    {0x7000, 0x1b, 8},  // Data Out 10
+    {0x7000, 0x1c, 8},  // Data Out 11
+    {0x7000, 0x1d, 8},  // Data Out 12
+    {0x7000, 0x1e, 8},  // Data Out 13
+    {0x7000, 0x1f, 8},  // Data Out 14
+    {0x7000, 0x20, 8},  // Data Out 15
+    {0x7000, 0x21, 8},  // Data Out 16
+    {0x7000, 0x22, 8},  // Data Out 17
+    {0x7000, 0x23, 8},  // Data Out 18
+    {0x7000, 0x24, 8},  // Data Out 19
+    {0x7000, 0x25, 8},  // Data Out 20
+    {0x7000, 0x26, 8},  // Data Out 21
 };
 
 static ec_pdo_entry_info_t lcec_el6021_pdo_entries_in[] = {
-    {0x6001, 0x01, 16},  // Status
-    {0x6000, 0x11, 8},   // Data In 0
-    {0x6000, 0x12, 8},   // Data In 1
-    {0x6000, 0x13, 8},   // Data In 2
-    {0x6000, 0x14, 8},   // Data In 3
-    {0x6000, 0x15, 8},   // Data In 4
-    {0x6000, 0x16, 8},   // Data In 5
-    {0x6000, 0x17, 8},   // Data In 6
-    {0x6000, 0x18, 8},   // Data In 7
-    {0x6000, 0x19, 8},   // Data In 8
-    {0x6000, 0x1a, 8},   // Data In 9
-    {0x6000, 0x1b, 8},   // Data In 10
-    {0x6000, 0x1c, 8},   // Data In 11
-    {0x6000, 0x1d, 8},   // Data In 12
-    {0x6000, 0x1e, 8},   // Data In 13
-    {0x6000, 0x1f, 8},   // Data In 14
-    {0x6000, 0x20, 8},   // Data In 15
-    {0x6000, 0x21, 8},   // Data In 16
-    {0x6000, 0x22, 8},   // Data In 17
-    {0x6000, 0x23, 8},   // Data In 18
-    {0x6000, 0x24, 8},   // Data In 19
-    {0x6000, 0x25, 8},   // Data In 20
-    {0x6000, 0x26, 8},   // Data In 21
+    {0x6000, 0x01, 1},  // Transmit accepted
+    {0x6000, 0x02, 1},  // Receive request
+    {0x6000, 0x03, 1},  // Init accepted
+    {0x6000, 0x04, 1},  // Buffer full
+    {0x6000, 0x05, 1},  // Parity error
+    {0x6000, 0x06, 1},  // Framing error
+    {0x6000, 0x07, 1},  // Overrun error
+    {0x0000, 0x00, 1},  // gap
+    {0x6000, 0x09, 8},  // Input length
+    {0x6000, 0x11, 8},  // Data In 0
+    {0x6000, 0x12, 8},  // Data In 1
+    {0x6000, 0x13, 8},  // Data In 2
+    {0x6000, 0x14, 8},  // Data In 3
+    {0x6000, 0x15, 8},  // Data In 4
+    {0x6000, 0x16, 8},  // Data In 5
+    {0x6000, 0x17, 8},  // Data In 6
+    {0x6000, 0x18, 8},  // Data In 7
+    {0x6000, 0x19, 8},  // Data In 8
+    {0x6000, 0x1a, 8},  // Data In 9
+    {0x6000, 0x1b, 8},  // Data In 10
+    {0x6000, 0x1c, 8},  // Data In 11
+    {0x6000, 0x1d, 8},  // Data In 12
+    {0x6000, 0x1e, 8},  // Data In 13
+    {0x6000, 0x1f, 8},  // Data In 14
+    {0x6000, 0x20, 8},  // Data In 15
+    {0x6000, 0x21, 8},  // Data In 16
+    {0x6000, 0x22, 8},  // Data In 17
+    {0x6000, 0x23, 8},  // Data In 18
+    {0x6000, 0x24, 8},  // Data In 19
+    {0x6000, 0x25, 8},  // Data In 20
+    {0x6000, 0x26, 8},  // Data In 21
 };
 
 static ec_pdo_info_t lcec_el6021_pdos[] = {
-    {0x1600, 23, lcec_el6021_pdo_entries_out},  // COM RxPDO-Map Outputs
-    {0x1a00, 23, lcec_el6021_pdo_entries_in},   // COM TxPDO-Map Inputs
+    {0x1604, 28, lcec_el6021_pdo_entries_out},  // COM RxPDO-Map Outputs
+    {0x1a04, 31, lcec_el6021_pdo_entries_in},   // COM TxPDO-Map Inputs
 };
 
 static ec_sync_info_t lcec_el6021_syncs[] = {
@@ -598,10 +616,10 @@ static int lcec_el6021_init(int comp_id, lcec_slave_t *slave) {
   // initialize sync info
   slave->sync_info = lcec_el6021_syncs;
 
-  // initialize POD entries (data windows are contiguous from 0x?000:11)
-  lcec_pdo_init(slave, 0x7001, 0x01, &hal_data->ctrl_os, NULL);
+  // initialize PDO entries (data windows are contiguous from 0x?000:11)
+  lcec_pdo_init(slave, 0x7000, 0x01, &hal_data->ctrl_os, &hal_data->ctrl_bp);
   lcec_pdo_init(slave, 0x7000, 0x11, &hal_data->tx_os, NULL);
-  lcec_pdo_init(slave, 0x6001, 0x01, &hal_data->status_os, NULL);
+  lcec_pdo_init(slave, 0x6000, 0x01, &hal_data->status_os, &hal_data->status_bp);
   lcec_pdo_init(slave, 0x6000, 0x11, &hal_data->rx_os, NULL);
 
   // export pins
