@@ -94,6 +94,9 @@ typedef struct {
   speed_t speed;
 } lcec_el6021_baud_t;
 
+/// The terminal has RTS/CTS (0x8000:01); only the RS232 EL6001 does
+#define LCEC_EL6021_FLAG_RTSCTS 1
+
 /// EL600x supported baud rates (SDO 0x8000:11 values)
 static const lcec_el6021_baud_t lcec_el6021_baud_table[] = {
     {1, 300, B300},       {2, 600, B600},       {3, 1200, B1200},     {4, 2400, B2400},   {5, 4800, B4800},
@@ -148,6 +151,7 @@ typedef struct {
   // req_* is the requested configuration (written by modparams and the
   // CUSE thread), pend_* is the snapshot the RT state machine is
   // applying, cur_* is what the terminal currently runs with.
+  uint8_t has_rtscts;
   uint8_t req_rtscts;
   uint8_t cur_rtscts;
   uint8_t req_baud;
@@ -287,8 +291,8 @@ static lcec_modparam_desc_t lcec_el6021_modparams[] = {
 
 static lcec_typelist_t types[] = {
     // clang-format off
-    {"EL6001", LCEC_BECKHOFF_VID, 0x17713052, 0, NULL, lcec_el6021_init, lcec_el6021_modparams},
-    {"EL6021", LCEC_BECKHOFF_VID, 0x17893052, 0, NULL, lcec_el6021_init, lcec_el6021_modparams},
+    {"EL6001", LCEC_BECKHOFF_VID, 0x17713052, LCEC_EL6021_FLAG_RTSCTS, NULL, lcec_el6021_init, lcec_el6021_modparams},
+    {"EL6021", LCEC_BECKHOFF_VID, 0x17853052, 0, NULL, lcec_el6021_init, lcec_el6021_modparams},
     // clang-format on
     {NULL},
 };
@@ -474,6 +478,9 @@ static int request_config(lcec_el6021_data_t *hal_data, tcflag_t cflag) {
   if (cflag_to_config(cflag, &baud_idx, &frame_idx, &rtscts) != 0) {
     return -1;
   }
+  if (rtscts && !hal_data->has_rtscts) {
+    return -1;  // RS422/RS485 terminals have no RTS/CTS
+  }
 
   pthread_mutex_lock(&hal_data->lock);
   hal_data->req_baud = baud_idx;
@@ -545,8 +552,13 @@ static int lcec_el6021_init(int comp_id, lcec_slave_t *slave) {
     }
   }
 
-  // apply serial configuration to the terminal (PREOP SDO writes)
-  if (lcec_write_sdo8(slave, 0x8000, 0x01, hal_data->req_rtscts) != 0) {
+  // apply serial configuration to the terminal (PREOP SDO writes);
+  // 0x8000:01 is RTS/CTS on the EL6001 but a padding bit on the EL6021
+  hal_data->has_rtscts = (slave->flags & LCEC_EL6021_FLAG_RTSCTS) != 0;
+  if (!hal_data->has_rtscts) {
+    hal_data->req_rtscts = 0;
+  }
+  if (hal_data->has_rtscts && lcec_write_sdo8(slave, 0x8000, 0x01, hal_data->req_rtscts) != 0) {
     rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "fail to configure slave %s.%s sdo RtsCts\n", master->name, slave->name);
     return -1;
   }
@@ -567,10 +579,12 @@ static int lcec_el6021_init(int comp_id, lcec_slave_t *slave) {
   config_to_ktermios(hal_data, &hal_data->tio);
 
   // runtime SDO requests for configuration changes while running
-  hal_data->sdo_rtscts = ecrt_slave_config_create_sdo_request(slave->config, 0x8000, 0x01, 1);
+  if (hal_data->has_rtscts) {
+    hal_data->sdo_rtscts = ecrt_slave_config_create_sdo_request(slave->config, 0x8000, 0x01, 1);
+  }
   hal_data->sdo_baud = ecrt_slave_config_create_sdo_request(slave->config, 0x8000, 0x11, 1);
   hal_data->sdo_frame = ecrt_slave_config_create_sdo_request(slave->config, 0x8000, 0x15, 1);
-  if (hal_data->sdo_rtscts == NULL || hal_data->sdo_baud == NULL || hal_data->sdo_frame == NULL) {
+  if ((hal_data->has_rtscts && hal_data->sdo_rtscts == NULL) || hal_data->sdo_baud == NULL || hal_data->sdo_frame == NULL) {
     rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failed to create SDO requests for slave %s.%s\n", master->name,
         slave->name);
     return -1;
