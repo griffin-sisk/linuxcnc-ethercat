@@ -801,7 +801,15 @@ static void lcec_el6021_write(lcec_slave_t *slave, long period) {
 
     case LCEC_EL6021_STATE_WAIT_INIT_RESPONSE:
       if (!(status & (1 << 2))) {
-        // init successful, first TX window is free
+        // Init successful. The terminal restarts its handshake with SW.0 and
+        // SW.1 at 0 (and saw CW.0/CW.1 at 0 during the init), so restart
+        // ours: a stale request toggle left at 1 by an odd number of TX
+        // windows before a re-init (baud/frame change) would make the next
+        // request look like no request, and TX stalls forever.
+        hal_data->tx_req_tgl = 0;
+        hal_data->rx_req_tgl = 0;
+        hal_data->rx_ack_tgl = 0;
+        // first TX window is free
         hal_data->tx_ack_tgl = 1;
         hal_data->control = 0x0000;
         hal_data->state = LCEC_EL6021_STATE_READY;
