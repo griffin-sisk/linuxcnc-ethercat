@@ -31,6 +31,7 @@ extern "C" {
 #include "lcec_conf.h"
 #include "lcec_hal_compat.h"
 #include "lcec_rtapi.h"
+#include "lcec_syncunit.h"
 #include <rtapi_ctype.h>
 #include <rtapi_math.h>
 #include <rtapi_string.h>
@@ -253,21 +254,78 @@ typedef struct lcec_pdo_entry_reg {
   ec_pdo_entry_reg_t *pdo_entry_regs;
 } lcec_pdo_entry_reg_t;
 
+/// @brief Per-Sync Unit HAL pins.
+typedef struct lcec_sync_unit_data {
+  hal_u32_t *wkc;             // Output: this unit's domain working counter
+  hal_u32_t *wkc_min;         // Output: min WKC since first complete exchange
+  hal_u32_t *wkc_change_cnt;  // Output: WKC change count since first complete exchange
+  hal_s32_t *wkc_state;       // Output: 0=zero, 1=incomplete, 2=complete (ec_wc_state_t)
+  hal_bit_t *wkc_reset;       // IO: set to 1 to clear min/change stats; self-clears
+  hal_bit_t *fresh;           // Output: new input data was read this cycle
+  hal_bit_t *threaded;        // Output: unit is serviced by its own HAL functs
+  hal_u32_t *late_cnt;        // Output: send ticks that found no new outputs from the unit thread
+  hal_u32_t *stale_cnt;       // Output: unit thread cycles that found no new inputs
+#ifdef RTAPI_TASK_PLL_SUPPORT
+  hal_s32_t *phase_err;           // Output: unit thread start vs target (ns)
+  hal_s32_t *pll_out;             // Output: period correction applied to the unit thread (ns)
+  hal_bit_t *phase_locked;        // Output: unit thread is locked to its slot on the DC grid
+  lcec_param_u32_t phase_offset;  // Param: target start of the unit thread after the receive tick (ns)
+  int32_t phase_lock_cnt;         // Internal: consecutive cycles inside the lock window
+#endif
+  uint32_t wkc_last;  // Internal: previous WKC value
+  int wkc_full_seen;  // Internal: domain reached EC_WC_COMPLETE at least once
+} lcec_sync_unit_data_t;
+
+/// @brief A Sync Unit: one EtherCAT domain exchanged every `cycle_divider`
+/// master cycles.
+///
+/// By default the master's read/write functs run the unit's drivers.  A unit
+/// with a divider of 2 or more also exports its own read/write functs; once
+/// those run in a HAL thread of the unit's cycle, the drivers run there
+/// instead and the master thread only moves the process image:
+///
+///   bus thread:  receive -> domain image -> rx (seqlock)
+///   unit thread: rx -> work image -> proc_read ... proc_write -> tx[]
+///   bus thread:  tx[tx_idx] -> domain image -> queue -> send
+///
+/// The bus thread never waits on the unit thread: rx is a seqlock only the
+/// (lower priority) unit thread retries on, tx is double buffered.
 typedef struct lcec_sync_unit {
   struct lcec_sync_unit *prev;
   struct lcec_sync_unit *next;
+  lcec_master_t *master;
   char name[LCEC_CONF_STR_MAXLEN];
   uint32_t cycle_time;
   unsigned int cycle_divider;
-  unsigned int cycle_counter;
+  unsigned int phase;  ///< Master cycle within the unit cycle the domain is sent on.
   int pdo_entry_count;
   lcec_pdo_entry_reg_t *regs;
   ec_domain_t *domain;
-  uint8_t *process_data;
+  uint8_t *process_data;  ///< The domain's process image.
   int process_data_len;
+  uint8_t *pd;  ///< The image the unit's drivers work on; see lcec_slave_pd().
   int queued;
   int process;
   int write;
+  lcec_sync_unit_data_t *hal_data;  ///< Unit pins, NULL for a master with a single unit.
+
+  // threaded operation (divider >= 2 only)
+  int threaded;          ///< Set by the unit read funct on its first call.
+  uint8_t *work;         ///< Image the drivers use in the unit thread.
+  lcec_su_xfer_t xfer;   ///< Image handoff with the bus thread.
+  uint32_t rx_gen_seen;  ///< Last received image the unit thread consumed.
+  uint32_t tx_gen_sent;  ///< Last output image the bus thread sent.
+  uint8_t *staged;       ///< Bus thread copy of the outputs, checked before it reaches the domain.
+  uint32_t pd_check;     ///< Unit cycles until the lcec_slave_pd() check, 0 once done.
+  int torn;              ///< The unit thread could not get a consistent rx image this cycle.
+  int task;              ///< rtapi task id of the thread running the unit's read funct.
+  int task_warned;       ///< One-shot guard for a write funct in the wrong thread.
+  int late_run;          ///< Consecutive send ticks without new outputs.
+  int stall_warned;      ///< One-shot guard for the stalled unit message.
+#ifdef RTAPI_TASK_PLL_SUPPORT
+  int pll_task;   ///< rtapi task id of the thread running the unit funct, or -1.
+  int pll_owner;  ///< This unit steers that thread's period.
+#endif
 } lcec_sync_unit_t;
 
 typedef struct lcec_master {
@@ -284,6 +342,10 @@ typedef struct lcec_master {
   lcec_sync_unit_t *first_sync_unit;
   lcec_sync_unit_t *last_sync_unit;
   int sync_units_started;
+  int sync_unit_count;
+  int64_t next_tick;  ///< Grid index of the tick the next write sends; tick 0 is the activation app time.
+  lcec_su_tick_t tick;  ///< Latest bus tick, for Sync Unit threads phase-locking to it.
+  int bus_task;         ///< rtapi task id of the thread running the master's read funct.
   lcec_slave_t *first_slave;
   lcec_slave_t *last_slave;
   lcec_master_data_t *hal_data;
@@ -383,7 +445,18 @@ typedef struct lcec_slave {
   unsigned int *fsoe_master_offset;           ///< FSoE master offset.
   uint64_t flags;                             ///< Flags, as defined by the driver itself.
   lcec_pdo_entry_reg_t *regs;
+  int pd_used;  ///< The driver called lcec_slave_pd() at least once.
 } lcec_slave_t;
+
+/// @brief Process image for a slave's proc_read/proc_write callbacks.
+///
+/// PDO offsets from lcec_pdo_init() index into this.  Drivers must use it
+/// rather than `master->process_data`: a Sync Unit serviced from its own HAL
+/// thread works on a private copy of its domain image.
+static inline uint8_t *lcec_slave_pd(lcec_slave_t *slave) {
+  slave->pd_used = 1;  // see the lcec_slave_pd() check in lcec_read_sync_unit()
+  return slave->sync_unit->pd;
+}
 
 /// @brief HAL pin description.
 typedef struct {
